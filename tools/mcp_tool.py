@@ -5045,15 +5045,16 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
 
         try:
             result = _call_once()
-            # Check if the MCP tool itself returned an error
-            try:
-                parsed = json.loads(result)
-                if "error" in parsed:
-                    _bump_server_error(server_name)
-                else:
-                    _reset_server_error(server_name)  # success — reset
-            except (json.JSONDecodeError, TypeError):
-                _reset_server_error(server_name)  # non-JSON = success
+            # The call returned, so the server is responsive. A tool-level
+            # ``{"error": ...}`` payload (isError content: bad path, HTTP 4xx
+            # from the upstream service, validation rejection, "old_text not
+            # found", …) is a successful round trip from the server's POV — it
+            # processed the request and reported a domain failure. It must NOT
+            # advance the circuit breaker; treating it as a transport failure
+            # tripped the breaker on healthy servers after a few innocent tool
+            # errors (issue #11113). Reset the consecutive-failure streak
+            # instead — only the transport exceptions handled below count.
+            _reset_server_error(server_name)
             return result
         except InterruptedError:
             return _interrupted_call_result()

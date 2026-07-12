@@ -101,6 +101,72 @@ def _cleanup(mcp_tool_module, name: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_error_envelope_responses_do_not_trip_breaker(monkeypatch, tmp_path):
+    """Repeated tool-level error results (isError → ``{"error": ...}``) must NOT
+    advance the circuit breaker: the server answered, only the operation
+    failed (issue #11113). Firing many more than the threshold keeps the
+    breaker fully closed.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from types import SimpleNamespace
+    from tools import mcp_tool
+    from tools.mcp_tool import _make_tool_handler
+
+    async def _call_tool_domain_error(*a, **kw):
+        # A healthy server reporting a domain failure via isError content.
+        return SimpleNamespace(
+            isError=True,
+            content=[SimpleNamespace(text="old_text not found")],
+        )
+
+    _install_stub_server(mcp_tool, "srv", _call_tool_domain_error)
+    mcp_tool._ensure_mcp_loop()
+
+    try:
+        handler = _make_tool_handler("srv", "vault_edit", 10.0)
+        for _ in range(mcp_tool._CIRCUIT_BREAKER_THRESHOLD + 3):
+            parsed = json.loads(handler({}))
+            assert "old_text not found" in parsed["error"]
+            # Never short-circuits — the server is reachable the whole time.
+            assert "unreachable" not in parsed["error"].lower()
+        assert mcp_tool._server_error_counts.get("srv", 0) == 0
+    finally:
+        _cleanup(mcp_tool, "srv")
+
+
+def test_error_envelope_resets_prior_transport_streak(monkeypatch, tmp_path):
+    """A responsive error result must RESET a partial transport-failure streak,
+    so two earlier transport blips plus a later domain error don't sum to a
+    trip (the failures weren't consecutive — the server answered in between).
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from types import SimpleNamespace
+    from tools import mcp_tool
+    from tools.mcp_tool import _make_tool_handler
+
+    async def _call_tool_domain_error(*a, **kw):
+        return SimpleNamespace(
+            isError=True,
+            content=[SimpleNamespace(text="bad path")],
+        )
+
+    _install_stub_server(mcp_tool, "srv", _call_tool_domain_error)
+    mcp_tool._ensure_mcp_loop()
+
+    try:
+        # Two prior transport failures already on the counter (one below the trip).
+        mcp_tool._server_error_counts["srv"] = mcp_tool._CIRCUIT_BREAKER_THRESHOLD - 1
+        handler = _make_tool_handler("srv", "vault_edit", 10.0)
+        parsed = json.loads(handler({}))
+        assert "error" in parsed
+        # The responsive error reset the streak to zero → breaker stays closed.
+        assert mcp_tool._server_error_counts.get("srv", 0) == 0
+    finally:
+        _cleanup(mcp_tool, "srv")
+
+
 def test_circuit_breaker_half_opens_after_cooldown(monkeypatch, tmp_path):
     """After a tripped breaker's cooldown elapses, the *next* call must
     actually execute against the session (half-open probe). When the
