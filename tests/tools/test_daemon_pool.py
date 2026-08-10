@@ -31,6 +31,26 @@ def test_workers_are_daemon_threads():
         pool.shutdown(wait=True)
 
 
+def test_initializer_and_initargs_run_in_worker():
+    """The initializer path must survive CPython's worker-context refactor.
+
+    CPython 3.14 moved initializer/initargs into a WorkerContext and changed
+    the _worker signature; a pool that still passed the 3.13 arguments raised
+    AttributeError: no attribute '_initializer' on the first submit().
+    """
+    seen = []
+    pool = DaemonThreadPoolExecutor(
+        max_workers=1,
+        initializer=lambda *a: seen.append(a),
+        initargs=("marker", 7),
+    )
+    try:
+        assert pool.submit(lambda: "ran").result(timeout=10) == "ran"
+        assert seen == [("marker", 7)]
+    finally:
+        pool.shutdown(wait=True)
+
+
 def test_idle_worker_reuse():
     pool = DaemonThreadPoolExecutor(max_workers=4)
     try:
