@@ -127,12 +127,26 @@ def _result_is_error(result) -> bool:
 
 
 def _record_call_outcome(server_name: str, result) -> Any:
-    """Breaker bookkeeping: an error payload from the tool itself still counts as a strike (#10447),
-    flagged as an application error so the open-breaker message stays truthful."""
-    if _result_is_error(result):
-        _core._bump_server_error(server_name, application=True)
-    else:
-        _core._reset_server_error(server_name)
+    """Breaker bookkeeping: the call returned, so the server is responsive.
+
+    LOCAL DIVERGENCE from upstream. Upstream still counts a tool-level
+    ``{"error": ...}`` payload as a strike (#10447) and only flags it
+    ``application=True`` so the open-breaker wording stops saying "unreachable"
+    (#11113). That leaves the behaviour we were actually bitten by intact: three
+    innocent domain errors from a *healthy* server (``mcp_vault_edit`` returning
+    "old_text not found") still open the breaker, after which every tool on that
+    server — including the search tool needed to find the right ``old_text`` —
+    short-circuits for the 60 s cooldown.
+
+    A tool-level error payload is a successful round trip from the server's point
+    of view: it processed the request and reported a domain failure. So reset the
+    consecutive-failure streak rather than merely skipping the increment, so an
+    earlier transport blip doesn't linger and sum with a later one. Only the
+    transport paths (``_strike`` and the ``_bump_server_error`` call sites around
+    acquire/reconnect) count against the breaker; the half-open probe still
+    re-arms on a failed probe.
+    """
+    _core._reset_server_error(server_name)
     return result
 
 
