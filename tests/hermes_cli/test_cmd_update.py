@@ -351,6 +351,48 @@ class TestRepairCurrentCheckoutRuntimeRepair:
         assert markers == []
 
 
+    def test_repair_refreshes_memory_provider_after_tool_restore(self, monkeypatch):
+        """The venv-repair path must heal memory-provider bridge packages like the
+        git-pull and ZIP paths do, after the tool-dep restore (#113741)."""
+        from hermes_cli import main as hm
+
+        calls: list = []
+        monkeypatch.setattr(
+            hm, "_refresh_active_memory_provider_dependencies", lambda: calls.append("memory"))
+        restored, _, _, _ = self._run(monkeypatch, repaired=True)
+        assert calls == ["memory"]
+        assert restored[-1][0] == "tools"
+
+    def test_venv_repair_path_refreshes_memory_provider(self, monkeypatch, tmp_path):
+        """The unhealthy-venv repair path heals memory-provider bridge packages too
+        (parity with pull/ZIP, #113741). Drives _repair_venv_on_current_checkout."""
+        from hermes_cli import main as hm
+
+        calls: list = []
+        monkeypatch.setattr(hm, "_abort_dependency_sync_if_self_locked", lambda *_a, **k: None)
+        monkeypatch.setattr(update_cmd, "_write_update_incomplete_marker", lambda: None)
+        monkeypatch.setattr(update_cmd, "_venv_core_imports_healthy", lambda: (True, "ok"))
+        monkeypatch.setattr(update_cmd, "project_venv_dir", lambda _root: tmp_path / "venv")
+        monkeypatch.setattr(
+            update_cmd, "venv_python_path", lambda _d, **k: tmp_path / "venv" / "bin" / "python")
+        monkeypatch.setattr(update_cmd, "_pip_install_prefix", lambda _uv: (["uv", "pip"], {}))
+        monkeypatch.setattr(
+            hm, "_install_python_dependencies_with_optional_fallback", lambda *_a, **k: None)
+        monkeypatch.setattr(hm, "_refresh_active_lazy_features", lambda *a, **k: True)
+        monkeypatch.setattr(hm, "_restore_active_tool_dependencies", lambda *a, **k: None)
+        monkeypatch.setattr(
+            hm, "_refresh_active_memory_provider_dependencies", lambda: calls.append("memory"))
+        monkeypatch.setattr(hm, "_clear_update_incomplete_marker", lambda: None)
+        monkeypatch.setattr(hm, "_is_windows", lambda: False)
+        monkeypatch.setattr("hermes_cli.managed_uv.ensure_uv", lambda **k: "uv")
+
+        assert update_cmd._repair_venv_on_current_checkout(
+            assume_yes=True, gateway_mode=False, pre_update_snapshot_id=None,
+            had_desktop_app_before_update=False, active_lazy_features=[],
+            active_tool_dependencies=[], _windows_gateway_resume=None,
+        )
+        assert calls == ["memory"]
+
 class TestCmdUpdateBranchFallback:
     """cmd_update falls back to main when current branch has no remote counterpart."""
 
@@ -587,8 +629,8 @@ class TestCmdUpdateBranchFallback:
             hm, "_sync_with_upstream_if_needed"
         ), patch.object(
             hm,
-            "_reload_updated_runtime_modules",
-            # Reaching the reload step IS the proof the post-update path ran
+            "_upgrade_pip_before_lazy_refresh",
+            # Reaching the lazy-refresh step IS the proof the post-update path ran
             # (the bug returned from "Already up to date!" before it). Abort
             # the pipeline right here: everything past this point (skills
             # sync, desktop rebuild, gateway restart, fleet check) would run
@@ -599,7 +641,7 @@ class TestCmdUpdateBranchFallback:
                 cmd_update(mock_args)
 
         assert exit_info.value.code == 0
-        post_update_step.assert_called_once_with()
+        post_update_step.assert_called_once()
         captured = capsys.readouterr()
         assert "Already up to date!" not in captured.out
 
@@ -612,8 +654,6 @@ class TestCmdUpdateBranchFallback:
         ), patch(
             "hermes_cli.config.get_missing_config_fields",
             return_value=[{"key": "new.option", "default": True}],
-        ), patch(
-            "hermes_cli.update_cmd._reload_config_modules"
         ), patch(
             "hermes_cli.update_cmd._run_config_check_fresh", return_value=(1, 2)
         ), patch(
@@ -656,8 +696,6 @@ class TestCmdUpdateMigrationPrompt:
         ), patch(
             "hermes_cli.config.get_missing_config_fields", return_value=[]
         ), patch(
-            "hermes_cli.update_cmd._reload_config_modules"
-        ), patch(
             "hermes_cli.update_cmd._run_config_check_fresh", return_value=(5, 24)
         ), patch(
             "hermes_cli.update_cmd._run_migrate_config_fresh",
@@ -694,8 +732,6 @@ class TestCmdUpdateMigrationPrompt:
             "hermes_cli.config.get_missing_env_vars", return_value=[]
         ), patch(
             "hermes_cli.config.get_missing_config_fields", return_value=[]
-        ), patch(
-            "hermes_cli.update_cmd._reload_config_modules"
         ), patch(
             "hermes_cli.update_cmd._run_config_check_fresh", return_value=(33, 34)
         ), patch(
@@ -737,8 +773,6 @@ class TestCmdUpdateMigrationPrompt:
         ), patch(
             "hermes_cli.config.get_missing_config_fields", return_value=cfg_items
         ), patch(
-            "hermes_cli.update_cmd._reload_config_modules"
-        ), patch(
             "hermes_cli.update_cmd._run_config_check_fresh", return_value=(1, 24)
         ), patch(
             "hermes_cli.update_cmd._run_migrate_config_fresh",
@@ -757,37 +791,6 @@ class TestCmdUpdateMigrationPrompt:
             assert "FOO_API_KEY" in out
             assert "Foo service API key" in out
             assert "display.new_widget" in out
-
-
-class TestConfigVersionCheckUsesFreshModules:
-    """Regression: config migration must use freshly-reloaded modules, not the
-    sys.modules cache from before git pull.
-
-    Before the fix, ``hermes update`` ran in the PRE-pull Python process.
-    After ``git pull`` updated the source on disk, function-level imports
-    returned the OLD cached ``hermes_cli.config`` module — so
-    ``DEFAULT_CONFIG["_config_version"]`` was stale and
-    ``check_config_version()`` reported ``(33, 33)`` "up to date" even though
-    the freshly-pulled code had v34 with a migration to run. The personality
-    reset migration (#81946) was silently skipped this way.
-    """
-
-    def test_run_config_check_fresh_reloads_modules(self):
-        """_run_config_check_fresh must call _reload_config_modules which
-        force-reloads the config modules from disk.
-
-        Regression: config migration was silently skipped because
-        sys.modules held the OLD hermes_cli.config with the OLD
-        DEFAULT_CONFIG["_config_version"] after git pull.
-        """
-        from unittest.mock import patch
-
-        import hermes_cli.update_cmd as update_cmd
-
-        with patch.object(update_cmd, "_reload_config_modules") as mock_reload:
-            update_cmd._run_config_check_fresh()
-
-        mock_reload.assert_called_once()
 
 
 class TestCmdUpdateProfileSkillSync:
