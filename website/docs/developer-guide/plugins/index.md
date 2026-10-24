@@ -86,9 +86,12 @@ them. An enabled package may provide immediate `skills/*/SKILL.md` directories
 and stdio MCP servers from root `mcp.json`. Skills are read-only, namespaced,
 and loaded through `skills_list` plus `skill_view`. MCP commands are passed as
 one executable token with a separate argument list, never through a shell.
-Use `skills_list` to discover the full qualified skill name. Portable skill
-namespaces have the deterministic form `agent-plugin-<slug>-<hash>`, derived
-from the discovered plugin key so sanitized names cannot collide. A portable
+A portable package's skills are named after the plugin, `<plugin-name>:<skill>`
+(`blender:blender`), the same form as a native plugin's; when two loaded plugins
+would register the same qualified name, the second one's skill is skipped with a
+warning naming both. Its data directory, `plugin-data/agent-plugin-<slug>-<hash>`,
+keeps a name derived from the discovered plugin key so sanitized names cannot
+collide on disk. A portable
 package's MCP servers keep the names their `mcp.json` gives them, the same rule
 as a user's own `mcp_servers` block, so the model-facing `mcp__<server>__<tool>`
 name keeps the tool verb inside the 64-character provider cap. A duplicate server
@@ -141,7 +144,7 @@ write-capable call instead of relying on the skill's instructions alone:
 
 The server name must match an `mcp.json` entry. With `untrusted`, every tool
 call to that server that is not annotated `readOnlyHint: true` asks the user
-first, and fails closed where nobody can answer (cron, unattended runs). The
+first (Once, Session or Always, per tool), and fails closed where nobody can answer (cron, unattended runs). The
 only other accepted value is `full`, the default, so a package can narrow
 access but never widen it. A `config.yaml` server with the same name replaces
 the package's entry, including its trust, but keeps the package's declared costs
